@@ -13,6 +13,7 @@ PUBLIC_IP="${PUBLIC_IP:-auto}"
 IMAGE="${IMAGE:-whn0thacked/telemt-docker:latest}"
 CONTAINER_NAME="${CONTAINER_NAME:-telemt}"
 RUST_LOG="${RUST_LOG:-info}"
+SECURITY_PROFILE="${SECURITY_PROFILE:-compat}"
 CONFIG_PATH="${CONFIG_PATH:-./telemt.toml}"
 COMPOSE_PATH="${COMPOSE_PATH:-./docker-compose.yml}"
 
@@ -31,6 +32,7 @@ Options:
   --image <image:tag>         Docker image (default: whn0thacked/telemt-docker:latest)
   --container-name <name>     Docker container name (default: telemt)
   --rust-log <level>          RUST_LOG value (default: info)
+  --security-profile <mode>   Security profile: compat|hardened (default: compat)
   --config-path <path>        telemt config path on host (default: ./telemt.toml)
   --compose-path <path>       docker-compose path (default: ./docker-compose.yml)
   --force                     Overwrite existing config/compose files
@@ -162,6 +164,10 @@ while [[ $# -gt 0 ]]; do
       RUST_LOG="$2"
       shift 2
       ;;
+    --security-profile)
+      SECURITY_PROFILE="$2"
+      shift 2
+      ;;
     --config-path)
       CONFIG_PATH="$2"
       shift 2
@@ -202,6 +208,11 @@ fi
 
 if [[ -n "$METRICS_PORT" ]] && ( ! [[ "$METRICS_PORT" =~ ^[0-9]+$ ]] || (( METRICS_PORT < 1 || METRICS_PORT > 65535 )) ); then
   echo "Invalid --metrics-port value: $METRICS_PORT" >&2
+  exit 1
+fi
+
+if [[ "$SECURITY_PROFILE" != "compat" && "$SECURITY_PROFILE" != "hardened" ]]; then
+  echo "Invalid --security-profile value: $SECURITY_PROFILE (allowed: compat|hardened)" >&2
   exit 1
 fi
 
@@ -318,9 +329,14 @@ EOF
 EOF
   fi
 
-  cat >>"$COMPOSE_PATH" <<EOF
+  if [[ "$SECURITY_PROFILE" == "hardened" ]]; then
+    cat >>"$COMPOSE_PATH" <<'EOF'
     security_opt:
       - no-new-privileges:true
+EOF
+  fi
+
+  cat >>"$COMPOSE_PATH" <<'EOF'
     cap_drop:
       - ALL
 EOF
@@ -348,6 +364,7 @@ fi
 
 if [[ "$NO_UP" -eq 1 ]]; then
   echo "Done. Files created, container not started (--no-up)."
+  echo "Security profile: $SECURITY_PROFILE"
   echo "TLS domain: $SELECTED_TLS_DOMAIN"
   if [[ -n "$SELECTED_PUBLIC_IP" ]]; then
     echo "Public IP (announce_ip): $SELECTED_PUBLIC_IP"
@@ -375,6 +392,7 @@ docker compose -f "$COMPOSE_PATH" up -d
 echo "Telemt is running."
 echo "Config: $CONFIG_PATH"
 echo "Compose: $COMPOSE_PATH"
+echo "Security profile: $SECURITY_PROFILE"
 echo "TLS domain: $SELECTED_TLS_DOMAIN"
 if [[ -n "$SELECTED_PUBLIC_IP" ]]; then
   echo "Public IP (announce_ip): $SELECTED_PUBLIC_IP"
