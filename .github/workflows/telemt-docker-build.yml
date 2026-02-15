@@ -1,0 +1,217 @@
+name: telemt-docker (build & push)
+
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Force build even if no new upstream release"
+        type: boolean
+        default: false
+
+  schedule:
+    # проверяем каждые 6 часов, появился ли новый релиз
+    - cron: "17 */6 * * *"
+
+  push:
+    branches: ["master"]
+    paths:
+      - "Dockerfile"
+      - ".github/workflows/telemt-docker-build.yml"
+
+concurrency:
+  group: telemt-docker-build
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+env:
+  IMAGE_NAME: whn0thacked/telemt-docker
+
+  UPSTREAM_OWNER: telemt
+  UPSTREAM_REPO: telemt
+
+  RUST_IMAGE: docker.io/library/rust:alpine
+  DISTROLESS_IMAGE: gcr.io/distroless/static:nonroot
+
+  STATE_FILE: .github/telemt-docker/state.json
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Fetch latest upstream release and compare with state
+        id: check
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$(dirname "${STATE_FILE}")"
+
+          # ── read previous state ──
+          prev_release_tag=""
+          prev_release_sha=""
+
+          if [ -f "${STATE_FILE}" ]; then
+            prev_release_tag="$(jq -r '.release_tag // ""' "${STATE_FILE}")"
+            prev_release_sha="$(jq -r '.release_sha // ""' "${STATE_FILE}")"
+          fi
+
+          # ── fetch latest release (not pre-release, not draft) ──
+          release_json="$(
+            curl -fsSL \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${{ github.token }}" \
+              "https://api.github.com/repos/${UPSTREAM_OWNER}/${UPSTREAM_REPO}/releases/latest"
+          )"
+
+          release_tag="$(echo "${release_json}" | jq -r '.tag_name')"
+          release_sha="$(echo "${release_json}" | jq -r '.target_commitish')"
+
+          # target_commitish может быть веткой, а не SHA — резолвим в точный коммит
+          if [[ "${release_sha}" =~ ^[0-9a-f]{40}$ ]]; then
+            : # уже SHA
+          else
+            # resolve tag → SHA через git refs
+            release_sha="$(
+              curl -fsSL \
+                -H "Accept: application/vnd.github+json" \
+                -H "Authorization: Bearer ${{ github.token }}" \
+                "https://api.github.com/repos/${UPSTREAM_OWNER}/${UPSTREAM_REPO}/git/ref/tags/${release_tag}" \
+              | jq -r '
+                  if .object.type == "tag" then .object.url
+                  else .object.sha
+                  end
+                '
+            )"
+
+            # если annotated tag — нужен ещё один запрос
+            if [[ "${release_sha}" == http* ]]; then
+              release_sha="$(
+                curl -fsSL \
+                  -H "Accept: application/vnd.github+json" \
+                  -H "Authorization: Bearer ${{ github.token }}" \
+                  "${release_sha}" \
+                | jq -r '.object.sha'
+              )"
+            fi
+          fi
+
+          # ── compare ──
+          changed=false
+          if [ -z "${prev_release_tag}" ] || [ "${prev_release_tag}" != "${release_tag}" ]; then
+            changed=true
+          fi
+
+          short_sha="${release_sha:0:12}"
+
+          # sanitize tag for docker (replace + with -)
+          docker_tag="$(echo "${release_tag}" | sed 's/[^a-zA-Z0-9._-]/-/g')"
+
+          {
+            echo "changed=${changed}"
+            echo "release_tag=${release_tag}"
+            echo "docker_tag=${docker_tag}"
+            echo "release_sha=${release_sha}"
+            echo "short_sha=${short_sha}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Build decision (log)
+        shell: bash
+        run: |
+          echo "changed=${{ steps.check.outputs.changed }}"
+          echo "release_tag=${{ steps.check.outputs.release_tag }}"
+          echo "release_sha=${{ steps.check.outputs.release_sha }}"
+          echo "force=${{ github.event.inputs.force }}"
+          echo "event=${{ github.event_name }}"
+
+      # ── Skip everything below when no new release and not forced ──
+      - name: Build and push (multi-arch)
+        if: |
+          steps.check.outputs.changed == 'true' ||
+          github.event_name == 'push' ||
+          (github.event_name == 'workflow_dispatch' && inputs.force == true)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          platforms: linux/amd64,linux/arm64
+
+          tags: |
+            ${{ env.IMAGE_NAME }}:latest
+            ${{ env.IMAGE_NAME }}:${{ steps.check.outputs.docker_tag }}
+            ${{ env.IMAGE_NAME }}:telemt-${{ steps.check.outputs.short_sha }}
+
+          build-args: |
+            TELEMT_REPO=https://github.com/${{ env.UPSTREAM_OWNER }}/${{ env.UPSTREAM_REPO }}.git
+            TELEMT_REF=${{ steps.check.outputs.release_tag }}
+
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+          labels: |
+            org.opencontainers.image.source=${{ github.repositoryUrl }}
+            org.opencontainers.image.revision=${{ steps.check.outputs.release_sha }}
+            org.opencontainers.image.version=${{ steps.check.outputs.release_tag }}
+
+      - name: Update state file
+        if: steps.check.outputs.changed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          now="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+
+          jq -n \
+            --arg upstream_owner "${UPSTREAM_OWNER}" \
+            --arg upstream_repo "${UPSTREAM_REPO}" \
+            --arg release_tag "${{ steps.check.outputs.release_tag }}" \
+            --arg release_sha "${{ steps.check.outputs.release_sha }}" \
+            --arg built_at_utc "${now}" \
+            '{
+              upstream: {
+                owner: $upstream_owner,
+                repo: $upstream_repo
+              },
+              release_tag: $release_tag,
+              release_sha: $release_sha,
+              built_at_utc: $built_at_utc
+            }' > "${STATE_FILE}"
+
+      - name: Commit & push updated state.json
+        if: steps.check.outputs.changed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add "${STATE_FILE}"
+
+          if git diff --cached --quiet; then
+            echo "No state changes to commit."
+            exit 0
+          fi
+
+          git commit -m "ci: update build state (release ${{ steps.check.outputs.release_tag }})"
+          git push

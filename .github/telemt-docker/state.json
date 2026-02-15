@@ -1,0 +1,9 @@
+{
+  "upstream": {
+    "owner": "telemt",
+    "repo": "telemt"
+  },
+  "release_tag": "3.0.0",
+  "release_sha": "a80db2ddbc812b85bdbba969a5d0703c2e272889",
+  "built_at_utc": "2026-02-15T14:06:23Z"
+}
