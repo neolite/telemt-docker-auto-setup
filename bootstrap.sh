@@ -9,7 +9,7 @@ TLS_DOMAIN="${TLS_DOMAIN:-auto}"
 PROXY_USER="${PROXY_USER:-hello}"
 PORT="${PORT:-443}"
 METRICS_PORT="${METRICS_PORT:-}"
-PUBLIC_IP="${PUBLIC_IP:-}"
+PUBLIC_IP="${PUBLIC_IP:-auto}"
 IMAGE="${IMAGE:-whn0thacked/telemt-docker:latest}"
 CONTAINER_NAME="${CONTAINER_NAME:-telemt}"
 RUST_LOG="${RUST_LOG:-info}"
@@ -26,7 +26,8 @@ Options:
   --user <name>               Username in [access.users] (default: hello)
   --port <port>               Telemt listen port (default: 443)
   --metrics-port <port>       Enable metrics port in config and compose
-  --public-ip <ip>            Adds announce_ip for IPv4 listener
+  --public-ip <ip|auto|none>  announce_ip behavior (default: auto)
+                              auto = detect external IPv4, none = disable announce_ip
   --image <image:tag>         Docker image (default: whn0thacked/telemt-docker:latest)
   --container-name <name>     Docker container name (default: telemt)
   --rust-log <level>          RUST_LOG value (default: info)
@@ -40,6 +41,8 @@ EOF
 
 TLS_DOMAIN_CANDIDATES="${TLS_DOMAIN_CANDIDATES:-yandex.ru,vk.com,ozon.ru,wildberries.ru,avito.ru,mail.ru,dzen.ru,kinopoisk.ru,sberbank.ru,gosuslugi.ru}"
 SELECTED_TLS_DOMAIN=""
+PUBLIC_IP_SOURCES="${PUBLIC_IP_SOURCES:-https://api64.ipify.org,https://ifconfig.me/ip,https://ipv4.icanhazip.com,https://checkip.amazonaws.com}"
+SELECTED_PUBLIC_IP=""
 
 resolve_tls_domain() {
   if [[ "$TLS_DOMAIN" != "auto" && "$TLS_DOMAIN" != "example.com" ]]; then
@@ -73,6 +76,56 @@ resolve_tls_domain() {
 
   SELECTED_TLS_DOMAIN="$(echo "${candidates[0]}" | tr -d '[:space:]')"
   echo "Warning: couldn't verify reachable domains. Fallback tls_domain=$SELECTED_TLS_DOMAIN"
+}
+
+is_valid_ipv4() {
+  local ip="$1"
+  if ! [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    return 1
+  fi
+
+  IFS='.' read -r o1 o2 o3 o4 <<< "$ip"
+  for oct in "$o1" "$o2" "$o3" "$o4"; do
+    if (( oct < 0 || oct > 255 )); then
+      return 1
+    fi
+  done
+  return 0
+}
+
+resolve_public_ip() {
+  if [[ "$PUBLIC_IP" == "none" ]]; then
+    SELECTED_PUBLIC_IP=""
+    return
+  fi
+
+  if [[ -n "$PUBLIC_IP" && "$PUBLIC_IP" != "auto" ]]; then
+    SELECTED_PUBLIC_IP="$PUBLIC_IP"
+    return
+  fi
+
+  if ! command -v curl >/dev/null 2>&1; then
+    echo "Warning: curl not found, cannot auto-detect public IP." >&2
+    SELECTED_PUBLIC_IP=""
+    return
+  fi
+
+  IFS=',' read -r -a sources <<< "$PUBLIC_IP_SOURCES"
+  for src in "${sources[@]}"; do
+    url="$(echo "$src" | tr -d '[:space:]')"
+    if [[ -z "$url" ]]; then
+      continue
+    fi
+
+    candidate="$(curl -fsS --max-time 5 --connect-timeout 3 "$url" 2>/dev/null | tr -d '\r\n[:space:]' || true)"
+    if is_valid_ipv4 "$candidate"; then
+      SELECTED_PUBLIC_IP="$candidate"
+      return
+    fi
+  done
+
+  echo "Warning: could not auto-detect external IPv4, announce_ip disabled." >&2
+  SELECTED_PUBLIC_IP=""
 }
 
 while [[ $# -gt 0 ]]; do
@@ -155,6 +208,7 @@ fi
 mkdir -p "$(dirname "$CONFIG_PATH")"
 mkdir -p "$(dirname "$COMPOSE_PATH")"
 resolve_tls_domain
+resolve_public_ip
 
 SECRET="$(openssl rand -hex 16)"
 USED_SECRET=""
@@ -195,9 +249,9 @@ EOF
 ip = "0.0.0.0"
 EOF
 
-  if [[ -n "$PUBLIC_IP" ]]; then
+  if [[ -n "$SELECTED_PUBLIC_IP" ]]; then
     cat >>"$CONFIG_PATH" <<EOF
-announce_ip = "$PUBLIC_IP"
+announce_ip = "$SELECTED_PUBLIC_IP"
 EOF
   fi
 
@@ -295,6 +349,11 @@ fi
 if [[ "$NO_UP" -eq 1 ]]; then
   echo "Done. Files created, container not started (--no-up)."
   echo "TLS domain: $SELECTED_TLS_DOMAIN"
+  if [[ -n "$SELECTED_PUBLIC_IP" ]]; then
+    echo "Public IP (announce_ip): $SELECTED_PUBLIC_IP"
+  else
+    echo "Public IP (announce_ip): disabled"
+  fi
   if [[ -n "$USED_SECRET" ]]; then
     echo "User: $PROXY_USER"
     echo "Secret: $USED_SECRET"
@@ -317,6 +376,11 @@ echo "Telemt is running."
 echo "Config: $CONFIG_PATH"
 echo "Compose: $COMPOSE_PATH"
 echo "TLS domain: $SELECTED_TLS_DOMAIN"
+if [[ -n "$SELECTED_PUBLIC_IP" ]]; then
+  echo "Public IP (announce_ip): $SELECTED_PUBLIC_IP"
+else
+  echo "Public IP (announce_ip): disabled"
+fi
 echo "User: $PROXY_USER"
 if [[ -n "$USED_SECRET" ]]; then
   echo "Secret: $USED_SECRET"
